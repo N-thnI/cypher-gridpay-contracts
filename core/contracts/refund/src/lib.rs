@@ -4461,7 +4461,9 @@ impl RefundContract {
             (RefundReasonCode::Other, other),
         ];
 
-        ordered.sort_by(|a, b| {
+        // `sort_by` needs `alloc`; the comparator is total (ties broken by a
+        // unique rank), so the unstable sort gives the same order.
+        ordered.sort_unstable_by(|a, b| {
             let count_cmp = b.1.cmp(&a.1);
             if count_cmp == core::cmp::Ordering::Equal {
                 Self::reason_code_rank(&a.0).cmp(&Self::reason_code_rank(&b.0))
@@ -9366,3 +9368,5 @@ mod test_merchant_override_and_error_codes;
 
 #[cfg(test)]
 mod test_admin_rotation;
+#[cfg(test)]
+mod test_utils;
