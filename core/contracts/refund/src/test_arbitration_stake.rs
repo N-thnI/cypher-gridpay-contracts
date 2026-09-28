@@ -483,7 +483,12 @@ fn test_escalation_with_disabled_stake() {
 fn setup_staked_arbitrator<'a>(
     env: &'a Env,
     stake: i128,
-) -> (RefundContractClient<'a>, Address, Address, token::Client<'a>) {
+) -> (
+    RefundContractClient<'a>,
+    Address,
+    Address,
+    token::Client<'a>,
+) {
     let admin = Address::generate(env);
     let arbitrator = Address::generate(env);
     let (stake_token_client, stake_token_admin) = create_token_contract(env, &admin);

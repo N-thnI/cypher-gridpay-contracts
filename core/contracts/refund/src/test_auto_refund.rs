@@ -264,7 +264,10 @@ fn test_register_trigger_rejects_more_than_max_conditions() {
         &all_of(&env, &conditions),
         &2_500u32,
     );
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions)))
+    );
 
     // Nested leaves count toward the same limit.
     let nested = all_of(
@@ -275,7 +278,10 @@ fn test_register_trigger_rejects_more_than_max_conditions() {
         ],
     );
     let result = client.try_register_auto_refund_trigger(&merchant, &7u64, &nested, &2_500u32);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions)))
+    );
 
     // Nesting deeper than MAX_TRIGGER_CONDITION_DEPTH is rejected even with few leaves.
     let too_deep = all_of(
@@ -283,12 +289,18 @@ fn test_register_trigger_rejects_more_than_max_conditions() {
         &[all_of(&env, &[all_of(&env, &[timeout_condition(9_000)])])],
     );
     let result = client.try_register_auto_refund_trigger(&merchant, &7u64, &too_deep, &2_500u32);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions)))
+    );
 
     // An empty composite is rejected rather than being vacuously true.
     let result =
         client.try_register_auto_refund_trigger(&merchant, &7u64, &all_of(&env, &[]), &2_500u32);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::TooManyTriggerConditions)))
+    );
 
     // Exactly MAX_TRIGGER_CONDITIONS is accepted.
     client.register_auto_refund_trigger(

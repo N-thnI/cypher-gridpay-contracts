@@ -12,14 +12,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          target: wasm32-unknown-unknown
+          target: wasm32v1-none
           components: clippy, rustfmt
 
       - name: Install Stellar CLI
         run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
 
       - name: Cache Cargo registry and build artifacts (core)
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -28,7 +28,7 @@ jobs:
           key: ${{ runner.os }}-cargo-core-${{ hashFiles('core/Cargo.lock') }}
 
       - name: Cache Cargo registry and build artifacts (orchestrator)
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -61,16 +61,19 @@ jobs:
         run: make check-size
         working-directory: core
 
+      # `shell: bash` enables pipefail, so test failures aren't masked by `tee`.
       - name: Run Tests (core)
+        shell: bash
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: core
 
       - name: Run Tests (orchestrator)
+        shell: bash
         run: cargo test --workspace 2>&1 | tee test-output.txt
         working-directory: orchestrator
 
       - name: Upload test output artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-output

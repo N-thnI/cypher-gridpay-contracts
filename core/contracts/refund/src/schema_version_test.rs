@@ -84,12 +84,8 @@ fn test_migrate_schema_upgrades_legacy_refunds_to_reason_code_other() {
     let legacy_a = legacy_refund(&env, 2, RefundStatus::Requested);
     let legacy_b = legacy_refund(&env, 3, RefundStatus::Processed);
     env.as_contract(&contract_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::Refund(2), &legacy_a);
-        env.storage()
-            .instance()
-            .set(&DataKey::Refund(3), &legacy_b);
+        env.storage().instance().set(&DataKey::Refund(2), &legacy_a);
+        env.storage().instance().set(&DataKey::Refund(3), &legacy_b);
         env.storage().instance().set(&DataKey::RefundCounter, &3u64);
     });
 

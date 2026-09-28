@@ -1,4 +1,6 @@
 #![no_std]
+// Contract entrypoints are the public ABI; their parameter lists are fixed.
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
     BytesN, Env, FromVal, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
@@ -967,6 +969,9 @@ enum ExternalPaymentStatus {
     Cancelled,
 }
 
+// Variant names are part of the on-chain encoding; they must match the
+// payment contract's `Currency` exactly, so they can't be renamed.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone)]
 #[contracttype]
 enum ExternalCurrency {
@@ -2184,7 +2189,7 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidPaymentId));
         }
 
-        if let Err(_) = Self::validate_bps(refund_bps) {
+        if Self::validate_bps(refund_bps).is_err() {
             return Err(Error::Core(CoreError::RefundExceedsPolicy));
         }
 
@@ -2804,7 +2809,7 @@ impl RefundContract {
                 let stake_token_client = token::Client::new(&env, &config.token);
                 stake_token_client.transfer(
                     &caller,
-                    &env.current_contract_address(),
+                    env.current_contract_address(),
                     &config.amount,
                 );
 
@@ -2833,7 +2838,7 @@ impl RefundContract {
             .instance()
             .set(&DataKey::PoolToken(case_id), &fee_token.clone());
         let token_client = token::Client::new(&env, &fee_token);
-        token_client.transfer(&caller, &env.current_contract_address(), &fee_amount);
+        token_client.transfer(&caller, env.current_contract_address(), &fee_amount);
 
         let now = env.ledger().timestamp();
         let timeout_secs: u64 = env
@@ -3117,7 +3122,7 @@ impl RefundContract {
             }
 
             // Distribute arbitrator share equally among majority voters
-            let per_arbitrator = if majority_voters.len() > 0 {
+            let per_arbitrator = if !majority_voters.is_empty() {
                 arbitrator_share / (majority_voters.len() as i128)
             } else {
                 0
@@ -3494,7 +3499,7 @@ impl RefundContract {
         // Emit RefundPolicySet event
         (RefundPolicySet {
             merchant,
-            tiers_count: policy.tiers.len() as u32,
+            tiers_count: policy.tiers.len(),
         })
         .publish(env);
     }
@@ -3735,7 +3740,7 @@ impl RefundContract {
             .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
 
-        if arbitrators.len() == 0 {
+        if arbitrators.is_empty() {
             return results;
         }
 
@@ -3771,7 +3776,7 @@ impl RefundContract {
         }
 
         // Return top `limit` arbitrators
-        let count = core::cmp::min(limit as u32, reputations.len());
+        let count = core::cmp::min(limit, reputations.len());
         for i in 0..count {
             results.push_back(reputations.get(i).unwrap());
         }
@@ -3798,7 +3803,7 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::InvalidScoreThreshold));
         }
 
-        let mut arbitrators: Vec<Address> = env
+        let arbitrators: Vec<Address> = env
             .storage()
             .instance()
             .get(&ArbitrationKey::ArbitratorList)
@@ -4063,7 +4068,7 @@ impl RefundContract {
 
         token::Client::new(&env, &config.token).transfer(
             &arbitrator,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
         env.storage().instance().set(&key, &total);
@@ -4631,7 +4636,7 @@ impl RefundContract {
 
         // Validate max_refund_bps is within bounds for all tiers (0-10000 basis points)
         for tier in tiers.iter() {
-            if let Err(_) = Self::validate_bps(tier.max_refund_bps) {
+            if Self::validate_bps(tier.max_refund_bps).is_err() {
                 return Err(Error::Core(CoreError::RefundExceedsPolicy));
             }
         }
@@ -4678,7 +4683,7 @@ impl RefundContract {
         // Emit RefundPolicySet event
         (RefundPolicySet {
             merchant,
-            tiers_count: sorted_tiers.len() as u32,
+            tiers_count: sorted_tiers.len(),
         })
         .publish(&env);
 
@@ -4812,7 +4817,7 @@ impl RefundContract {
             .set(&DataKey::DefaultRefundPolicy, &policy);
         (DefaultRefundPolicySet {
             set_by: admin,
-            tiers_count: policy.tiers.len() as u32,
+            tiers_count: policy.tiers.len(),
         })
         .publish(&env);
         Ok(())
@@ -6166,7 +6171,8 @@ impl RefundContract {
                 }
                 let mut total = 0u32;
                 for child in inner.iter() {
-                    total = total.saturating_add(Self::count_trigger_conditions(&child, depth + 1)?);
+                    total =
+                        total.saturating_add(Self::count_trigger_conditions(&child, depth + 1)?);
                     if total > MAX_TRIGGER_CONDITIONS {
                         return Err(Error::Ext(ExtError::TooManyTriggerConditions));
                     }
@@ -6612,6 +6618,8 @@ impl RefundContract {
     /// A `CircuitBreakerState` indicating whether the breaker is tripped, the trip count,
     /// the last observed refund rate, and the auto-reset timestamp.
     pub fn get_circuit_breaker_state(env: Env) -> CircuitBreakerState {
+        // Only mutated by the #[cfg(test)] override below.
+        #[cfg_attr(not(test), allow(unused_mut))]
         let mut state = env
             .storage()
             .instance()
@@ -6932,11 +6940,9 @@ impl RefundContract {
         }
 
         // Calculate refund rate
-        let refund_rate_bps: u32 = if total_payments > 0 {
-            ((total_refunds * 10000) / total_payments) as u32
-        } else {
-            0
-        };
+        let refund_rate_bps: u32 = (total_refunds * 10000)
+            .checked_div(total_payments)
+            .unwrap_or(0) as u32;
 
         // Check if refund rate exceeds threshold
         if refund_rate_bps > config.max_refund_rate_bps {
@@ -6948,7 +6954,7 @@ impl RefundContract {
             match existing_signal {
                 Some(mut signal) if !signal.reviewed => {
                     // Update existing signal
-                    signal.refund_rate_bps = refund_rate_bps as u32;
+                    signal.refund_rate_bps = refund_rate_bps;
                     signal.total_payments = total_payments;
                     signal.total_refunds = total_refunds;
                     env.storage()
@@ -6960,7 +6966,7 @@ impl RefundContract {
                     // Create new fraud signal
                     let signal = FraudSignal {
                         address: address.clone(),
-                        refund_rate_bps: refund_rate_bps as u32,
+                        refund_rate_bps,
                         total_payments,
                         total_refunds,
                         flagged_at: env.ledger().timestamp(),
@@ -6988,7 +6994,7 @@ impl RefundContract {
                     // Emit fraud signal raised event
                     (FraudSignalRaised {
                         address,
-                        refund_rate_bps: refund_rate_bps as u32,
+                        refund_rate_bps,
                     })
                     .publish(&env);
 
@@ -7242,7 +7248,7 @@ impl RefundContract {
     }
 
     fn check_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
-        let config: RefundCooldownConfig = match env
+        let _config: RefundCooldownConfig = match env
             .storage()
             .instance()
             .get::<SystemKey, RefundCooldownConfig>(&SystemKey::RefundCooldownConfig)
@@ -7320,7 +7326,7 @@ impl RefundContract {
         }
 
         // Calculate range for newest-first ordering
-        let end = core::cmp::min(total, offset.saturating_add(limit));
+        let _end = core::cmp::min(total, offset.saturating_add(limit));
 
         // Iterate in reverse order (newest first)
         let mut collected = 0u64;
@@ -7394,11 +7400,9 @@ impl RefundContract {
             index += 1;
         }
 
-        let avg_processing_time = if processed_count > 0 {
-            total_processing_time / processed_count
-        } else {
-            0
-        };
+        let avg_processing_time = total_processing_time
+            .checked_div(processed_count)
+            .unwrap_or(0);
 
         CustomerRefundSummary {
             total_requested,
@@ -7963,14 +7967,12 @@ impl RefundContract {
         let mut had_failure = false;
 
         for refund_id in refund_ids.iter() {
-            let result = (|| -> Result<(), Error> {
-                Self::begin_refund_rejection(
-                    &env,
-                    admin.clone(),
-                    refund_id,
-                    soroban_sdk::String::from_str(&env, "batch rejection"),
-                )
-            })();
+            let result = Self::begin_refund_rejection(
+                &env,
+                admin.clone(),
+                refund_id,
+                soroban_sdk::String::from_str(&env, "batch rejection"),
+            );
             match result {
                 Ok(()) => succeeded.push_back(refund_id),
                 Err(_) => {
@@ -8160,7 +8162,7 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
-        if panel_size as u32 > arbitrators.len() {
+        if panel_size > arbitrators.len() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
@@ -8204,14 +8206,14 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
-        let total = arbitrators.len() as u32;
+        let total = arbitrators.len();
         if config.panel_size > total {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
         let mut panel = Vec::new(&env);
         for i in 0..config.panel_size {
-            let idx = ((config.rotation_index + i) % total) as u32;
+            let idx = (config.rotation_index + i) % total;
             panel.push_back(arbitrators.get(idx).unwrap());
         }
 
@@ -8258,7 +8260,7 @@ impl RefundContract {
             .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
 
-        let total = arbitrators.len() as u32;
+        let total = arbitrators.len();
         if total == 0 || count == 0 {
             return Vec::new(&env);
         }
@@ -8266,7 +8268,7 @@ impl RefundContract {
         let n = if count > total { total } else { count };
         let mut result = Vec::new(&env);
         for i in 0..n {
-            let idx = ((config.rotation_index + i) % total) as u32;
+            let idx = (config.rotation_index + i) % total;
             result.push_back(arbitrators.get(idx).unwrap());
         }
         result
@@ -8992,7 +8994,7 @@ impl RefundContract {
             .get(&ArbitrationKey::SeniorArbitratorList)
             .unwrap_or(Vec::new(&env));
 
-        if senior_list.len() == 0 {
+        if senior_list.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
@@ -9181,7 +9183,7 @@ impl RefundContract {
     }
 
     fn validate_bps(bps: u32) -> Result<(), Error> {
-        if bps < 1 || bps > 10000 {
+        if !(1..=10000).contains(&bps) {
             return Err(Error::Core(CoreError::InvalidAmount));
         };
 
