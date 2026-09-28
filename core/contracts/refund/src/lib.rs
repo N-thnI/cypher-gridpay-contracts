@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
-    BytesN, Env, FromVal, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    BytesN, Env, FromVal, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 #[cfg(test)]
@@ -113,6 +113,8 @@ pub enum ArbitrationKey {
     // Uniqueness guard: maps refund_id -> case_id so the same refund
     // cannot be escalated into multiple parallel arbitration cases.
     CaseByRefund(u64),
+    // Participation stake deposited by an arbitrator (slashable by admin)
+    ArbitratorStake(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +310,12 @@ pub enum ExtError {
     // Issue #389: two-step admin rotation errors
     NoPendingAdmin = 59,
     NotPendingAdmin = 60,
+    // Merchant refund quota would be exceeded by an approval
+    MerchantQuotaExceeded = 61,
+    // Auto-refund trigger has more conditions (or nesting) than allowed
+    TooManyTriggerConditions = 62,
+    // Slash amount exceeds the arbitrator's deposited stake
+    InsufficientArbitratorStake = 63,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -497,6 +505,23 @@ pub struct StakeReturned {
     pub case_id: u64,
     pub winner: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorStakeDeposited {
+    pub arbitrator: Address,
+    pub amount: i128,
+    pub total_stake: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorStakeSlashed {
+    pub arbitrator: Address,
+    pub amount: i128,
+    pub recipient: Address,
+    pub remaining_stake: i128,
 }
 
 #[contractevent]
@@ -735,6 +760,55 @@ pub struct Refund {
     pub expires_at: Option<u64>,
 }
 
+// Schema v1 shape of `Refund`, written before `reason_code` was added
+// (Issue #397). Only used by `migrate_schema` to upgrade legacy records.
+#[derive(Clone)]
+#[contracttype]
+pub struct LegacyRefundV1 {
+    pub id: u64,
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub original_payment_amount: i128,
+    pub token: Address,
+    pub original_token: Address,
+    pub status: RefundStatus,
+    pub requested_at: u64,
+    pub reason: String,
+    pub approved_at: Option<u64>,
+    pub rejected_at: Option<u64>,
+    pub processed_at: Option<u64>,
+    pub rejected_by: Option<Address>,
+    pub appeal_deadline: Option<u64>,
+    pub expires_at: Option<u64>,
+}
+
+impl LegacyRefundV1 {
+    fn into_refund(self, reason_code: RefundReasonCode) -> Refund {
+        Refund {
+            id: self.id,
+            payment_id: self.payment_id,
+            merchant: self.merchant,
+            customer: self.customer,
+            amount: self.amount,
+            original_payment_amount: self.original_payment_amount,
+            token: self.token,
+            original_token: self.original_token,
+            status: self.status,
+            requested_at: self.requested_at,
+            reason: self.reason,
+            reason_code,
+            approved_at: self.approved_at,
+            rejected_at: self.rejected_at,
+            processed_at: self.processed_at,
+            rejected_by: self.rejected_by,
+            appeal_deadline: self.appeal_deadline,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct PaymentRefundCap {
@@ -872,7 +946,16 @@ pub struct ContractStateMatchCondition {
 pub enum AutoRefundCondition {
     FulfillmentTimeout(FulfillmentTimeoutCondition),
     ContractStateMatch(ContractStateMatchCondition),
+    // Composite condition: met only when every inner condition is met.
+    // Evaluation short-circuits on the first unmet condition.
+    All(Vec<AutoRefundCondition>),
 }
+
+// Upper bound on leaf conditions per trigger, so evaluating a trigger (each
+// ContractStateMatch is a cross-contract call) stays within Soroban limits.
+pub const MAX_TRIGGER_CONDITIONS: u32 = 5;
+// Upper bound on `All` nesting depth, for the same reason.
+pub const MAX_TRIGGER_CONDITION_DEPTH: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -1354,6 +1437,8 @@ pub struct RefundContract;
 impl RefundContract {
     const BATCH_DECISION_LIMIT: u32 = 50;
     const INITIAL_SCHEMA_VERSION: u32 = 1;
+    // Schema version at which every stored `Refund` carries a `reason_code`.
+    const REASON_CODE_SCHEMA_VERSION: u32 = 2;
 
     /// Initialize the refund contract with an admin address.
     ///
@@ -1432,6 +1517,14 @@ impl RefundContract {
         let current = Self::get_schema_version(env.clone());
         if current >= target_version {
             return Err(Error::Ext(ExtError::SchemaAlreadyAtTarget));
+        }
+
+        // v1 -> v2: refunds written before `reason_code` existed would panic on
+        // deserialization as `Refund`; rewrite them with `RefundReasonCode::Other`.
+        if current < Self::REASON_CODE_SCHEMA_VERSION
+            && target_version >= Self::REASON_CODE_SCHEMA_VERSION
+        {
+            Self::migrate_legacy_refunds(&env);
         }
 
         env.storage()
@@ -1620,6 +1713,7 @@ impl RefundContract {
     /// Returns `Unauthorized` if the caller is not the admin.
     /// Returns `InvalidStatus` if the refund is not in `Requested` status.
     /// Returns `RefundWindowExpired` if the refund's TTL has expired.
+    /// Returns `MerchantQuotaExceeded` if the merchant's remaining quota is below the amount.
     pub fn approve_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
         Self::require_not_paused(&env, "approve_refund")?;
         // Require admin authentication
@@ -2040,7 +2134,7 @@ impl RefundContract {
     /// Process an approved refund for payout.
     ///
     /// Changes the refund status from `Approved` to `Processed`, deducts platform fees,
-    /// enforces merchant refund quota, and emits a `RefundProcessed` event.
+    /// and emits a `RefundProcessed` event. Merchant quota is consumed at approval.
     ///
     /// # Arguments
     /// * `admin` - The admin address (must be authorized).
@@ -2048,7 +2142,6 @@ impl RefundContract {
     ///
     /// # Errors
     /// Returns `InvalidStatus` if the refund is not in `Approved` status.
-    /// Returns `RefundExceedsPolicy` if the merchant quota is exceeded.
     /// Returns `TotalRefundsExceedPayment` if processing would exceed the original payment.
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
         Self::require_not_paused(&env, "process_refund")?;
@@ -2076,6 +2169,8 @@ impl RefundContract {
     /// Returns `RefundExceedsPolicy` if `refund_bps` is out of valid range.
     /// Returns `Unauthorized` if the caller is not the payment's merchant.
     /// Returns `DuplicateAutoRefundTrigger` if an identical active trigger exists.
+    /// Returns `TooManyTriggerConditions` if the condition has more than
+    /// `MAX_TRIGGER_CONDITIONS` leaves or nests deeper than `MAX_TRIGGER_CONDITION_DEPTH`.
     pub fn register_auto_refund_trigger(
         env: Env,
         merchant: Address,
@@ -2092,6 +2187,8 @@ impl RefundContract {
         if let Err(_) = Self::validate_bps(refund_bps) {
             return Err(Error::Core(CoreError::RefundExceedsPolicy));
         }
+
+        Self::validate_trigger_condition(&condition)?;
 
         let payment = Self::get_external_payment(&env, payment_id)?;
         if payment.merchant != merchant {
@@ -2164,6 +2261,9 @@ impl RefundContract {
         if !trigger.active {
             return Ok(false);
         }
+
+        // Defensive: triggers stored before the condition limit existed.
+        Self::validate_trigger_condition(&trigger.condition)?;
 
         let condition_met = Self::evaluate_auto_refund_condition(&env, &trigger.condition)?;
         if !condition_met {
@@ -3921,6 +4021,140 @@ impl RefundContract {
             .get(&ArbitrationKey::ArbitrationStake(case_id))
     }
 
+    /// Deposit a participation stake as a registered arbitrator.
+    ///
+    /// The stake is held in the configured arbitration stake token and can be
+    /// slashed by the admin via [`Self::slash_arbitrator_stake`].
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `amount` is not positive.
+    /// Returns `NotArbitrator` if the caller is not a registered arbitrator.
+    /// Returns `PolicyNotFound` if no arbitration stake config is set.
+    pub fn deposit_arbitrator_stake(
+        env: Env,
+        arbitrator: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        arbitrator.require_auth();
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+        if !arbitrators.contains(&arbitrator) {
+            return Err(Error::Core(CoreError::NotArbitrator));
+        }
+
+        let config: ArbitrationStakeConfig = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationStakeConfig)
+            .ok_or(Error::Core(CoreError::PolicyNotFound))?;
+
+        let key = ArbitrationKey::ArbitratorStake(arbitrator.clone());
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let total = current
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+
+        token::Client::new(&env, &config.token).transfer(
+            &arbitrator,
+            &env.current_contract_address(),
+            &amount,
+        );
+        env.storage().instance().set(&key, &total);
+
+        ArbitratorStakeDeposited {
+            arbitrator,
+            amount,
+            total_stake: total,
+        }
+        .publish(&env);
+
+        Ok(total)
+    }
+
+    /// Get the participation stake currently held for an arbitrator.
+    pub fn get_arbitrator_stake(env: Env, arbitrator: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorStake(arbitrator))
+            .unwrap_or(0)
+    }
+
+    /// Slash part of an arbitrator's stake for a fraudulent ruling or for
+    /// missing an arbitration deadline, redistributing it to `recipient`
+    /// (typically the affected customer or an insurance pool).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must be authorized).
+    /// * `arbitrator` - The arbitrator whose stake is slashed.
+    /// * `slash_amount` - The amount to slash.
+    /// * `recipient` - The address that receives the slashed tokens.
+    ///
+    /// # Returns
+    /// The arbitrator's remaining stake.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    /// Returns `InvalidAmount` if `slash_amount` is not positive.
+    /// Returns `InsufficientArbitratorStake` if `slash_amount` exceeds the stake.
+    /// Returns `PolicyNotFound` if no arbitration stake config is set.
+    pub fn slash_arbitrator_stake(
+        env: Env,
+        admin: Address,
+        arbitrator: Address,
+        slash_amount: i128,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if slash_amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let key = ArbitrationKey::ArbitratorStake(arbitrator.clone());
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if slash_amount > current {
+            return Err(Error::Ext(ExtError::InsufficientArbitratorStake));
+        }
+
+        let config: ArbitrationStakeConfig = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationStakeConfig)
+            .ok_or(Error::Core(CoreError::PolicyNotFound))?;
+
+        let remaining = current - slash_amount;
+        env.storage().instance().set(&key, &remaining);
+        token::Client::new(&env, &config.token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &slash_amount,
+        );
+
+        ArbitratorStakeSlashed {
+            arbitrator,
+            amount: slash_amount,
+            recipient,
+            remaining_stake: remaining,
+        }
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
     /// Get a paginated list of refunds filtered by status.
     ///
     /// # Arguments
@@ -5622,6 +5856,11 @@ impl RefundContract {
             }
         };
 
+        // Refunds that skip the approval step must still consume merchant quota.
+        if initial_status == RefundStatus::Approved {
+            Self::reserve_merchant_quota(&env, &merchant, amount)?;
+        }
+
         let ttl_expires_at: Option<u64> = env
             .storage()
             .instance()
@@ -5747,6 +5986,10 @@ impl RefundContract {
             }
         }
 
+        // Reserve merchant quota at approval time, in the same step that flips
+        // the status, so approved-but-unprocessed refunds count against it.
+        Self::reserve_merchant_quota(env, &refund.merchant, refund.amount)?;
+
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
@@ -5805,31 +6048,7 @@ impl RefundContract {
             );
         }
 
-        // Enforce merchant refund quota if configured
-        if let Some(mut quota) = env
-            .storage()
-            .instance()
-            .get::<_, MerchantRefundQuota>(&DataKey::MerchantRefundQuota(refund.merchant.clone()))
-        {
-            let now = env.ledger().timestamp();
-            // auto-reset if period elapsed
-            if now > quota.period_start.saturating_add(quota.period_seconds) {
-                quota.used = 0;
-                quota.period_start = now;
-            }
-            let new_used = quota
-                .used
-                .checked_add(refund.amount)
-                .ok_or(Error::Core(CoreError::InvalidAmount))?;
-            if new_used > quota.limit {
-                return Err(Error::Core(CoreError::RefundExceedsPolicy));
-            }
-            quota.used = new_used;
-            env.storage().instance().set(
-                &DataKey::MerchantRefundQuota(refund.merchant.clone()),
-                &quota,
-            );
-        }
+        // Merchant quota was already reserved when this refund was approved.
 
         Self::remove_from_status_index(env, RefundStatus::Approved, refund_id)?;
         refund.status = RefundStatus::Processed;
@@ -5877,11 +6096,106 @@ impl RefundContract {
         }
     }
 
+    /// Debit `amount` from the merchant's refund quota (if one is configured).
+    ///
+    /// The remaining allowance is checked and the new usage written in one
+    /// step, so a sequence of approvals can never collectively exceed `limit`.
+    fn reserve_merchant_quota(env: &Env, merchant: &Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::MerchantRefundQuota(merchant.clone());
+        let mut quota: MerchantRefundQuota = match env.storage().instance().get(&key) {
+            Some(quota) => quota,
+            None => return Ok(()),
+        };
+
+        let now = env.ledger().timestamp();
+        // auto-reset if period elapsed
+        if now > quota.period_start.saturating_add(quota.period_seconds) {
+            quota.used = 0;
+            quota.period_start = now;
+        }
+
+        let remaining = quota
+            .limit
+            .checked_sub(quota.used)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        if remaining < amount {
+            return Err(Error::Ext(ExtError::MerchantQuotaExceeded));
+        }
+        quota.used = quota
+            .used
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        env.storage().instance().set(&key, &quota);
+        Ok(())
+    }
+
+    /// Rewrite every stored refund still in the pre-`reason_code` shape.
+    fn migrate_legacy_refunds(env: &Env) {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+        for refund_id in 1..=counter {
+            let key = DataKey::Refund(refund_id);
+            // Read as a raw field map: decoding a legacy record directly as
+            // `Refund` traps in the host on the field-count mismatch.
+            let fields: Map<Symbol, Val> = match env.storage().instance().get(&key) {
+                Some(fields) => fields,
+                None => continue,
+            };
+            if fields.contains_key(Symbol::new(env, "reason_code")) {
+                continue;
+            }
+            if let Ok(legacy) = LegacyRefundV1::try_from_val(env, &fields.to_val()) {
+                let refund = legacy.into_refund(RefundReasonCode::Other);
+                env.storage().instance().set(&key, &refund);
+            }
+        }
+    }
+
+    /// Count leaf conditions in `condition`, rejecting nesting deeper than
+    /// `MAX_TRIGGER_CONDITION_DEPTH`.
+    fn count_trigger_conditions(condition: &AutoRefundCondition, depth: u32) -> Result<u32, Error> {
+        match condition {
+            AutoRefundCondition::All(inner) => {
+                if depth >= MAX_TRIGGER_CONDITION_DEPTH || inner.is_empty() {
+                    return Err(Error::Ext(ExtError::TooManyTriggerConditions));
+                }
+                let mut total = 0u32;
+                for child in inner.iter() {
+                    total = total.saturating_add(Self::count_trigger_conditions(&child, depth + 1)?);
+                    if total > MAX_TRIGGER_CONDITIONS {
+                        return Err(Error::Ext(ExtError::TooManyTriggerConditions));
+                    }
+                }
+                Ok(total)
+            }
+            _ => Ok(1),
+        }
+    }
+
+    fn validate_trigger_condition(condition: &AutoRefundCondition) -> Result<(), Error> {
+        if Self::count_trigger_conditions(condition, 0)? > MAX_TRIGGER_CONDITIONS {
+            return Err(Error::Ext(ExtError::TooManyTriggerConditions));
+        }
+        Ok(())
+    }
+
     fn evaluate_auto_refund_condition(
         env: &Env,
         condition: &AutoRefundCondition,
     ) -> Result<bool, Error> {
         match condition {
+            AutoRefundCondition::All(inner) => {
+                for child in inner.iter() {
+                    // Early exit: skip remaining (possibly cross-contract) checks.
+                    if !Self::evaluate_auto_refund_condition(env, &child)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             AutoRefundCondition::FulfillmentTimeout(config) => {
                 Ok(env.ledger().timestamp() >= config.fulfillment_deadline)
             }
