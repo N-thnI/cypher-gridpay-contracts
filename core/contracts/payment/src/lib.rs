@@ -1,11 +1,46 @@
 // This contract uses a multi-level enum structure for DataKey and Error to stay within
 // Soroban's 50-variant XDR limit. Each sub-enum must have <= 50 variants.
 #![no_std]
-use escrow::EscrowContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
+
+/// The subset of the escrow contract's interface this contract calls.
+///
+/// Declared locally instead of depending on the `escrow` crate: linking it
+/// would pull escrow's exported contract functions into this contract's wasm
+/// and fail with duplicate symbols (e.g. `add_admin`).
+#[allow(dead_code)]
+#[contractclient(name = "EscrowContractClient")]
+pub trait EscrowInterface {
+    fn create_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+    ) -> Result<u64, soroban_sdk::Error>;
+    fn release_escrow(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        early_release: bool,
+    ) -> Result<(), soroban_sdk::Error>;
+    fn refund_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), soroban_sdk::Error>;
+    fn dispute_escrow(env: Env, caller: Address, escrow_id: u64)
+        -> Result<(), soroban_sdk::Error>;
+    fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        release_to_merchant: bool,
+    ) -> Result<(), soroban_sdk::Error>;
+}
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]

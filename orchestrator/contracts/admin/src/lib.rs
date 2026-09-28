@@ -1,8 +1,19 @@
 #![no_std]
-use escrow::EscrowContractClient;
-use payments::PaymentContractClient;
-use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, String,
+};
+
+/// Pause interface shared by the payment, escrow, and refund contracts.
+///
+/// Declared locally instead of depending on those crates: linking them would
+/// pull their exported contract functions into this contract's wasm and fail
+/// with duplicate symbols.
+#[allow(dead_code)]
+#[contractclient(name = "PausableContractClient")]
+pub trait PausableContract {
+    fn pause_contract(env: Env, admin: Address, reason: String) -> Result<(), soroban_sdk::Error>;
+    fn unpause_contract(env: Env, admin: Address) -> Result<(), soroban_sdk::Error>;
+}
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -110,9 +121,9 @@ impl AdminContract {
             .get(&DataKey::RefundContract)
             .ok_or(Error::NotInitialized)?;
 
-        PaymentContractClient::new(&env, &payment_contract).pause_contract(&pauser, &reason);
-        EscrowContractClient::new(&env, &escrow_contract).pause_contract(&pauser, &reason);
-        RefundContractClient::new(&env, &refund_contract).pause_contract(&pauser, &reason);
+        PausableContractClient::new(&env, &payment_contract).pause_contract(&pauser, &reason);
+        PausableContractClient::new(&env, &escrow_contract).pause_contract(&pauser, &reason);
+        PausableContractClient::new(&env, &refund_contract).pause_contract(&pauser, &reason);
 
         Ok(())
     }
@@ -157,9 +168,9 @@ impl AdminContract {
             .get(&DataKey::RefundContract)
             .ok_or(Error::NotInitialized)?;
 
-        PaymentContractClient::new(&env, &payment_contract).unpause_contract(&pauser);
-        EscrowContractClient::new(&env, &escrow_contract).unpause_contract(&pauser);
-        RefundContractClient::new(&env, &refund_contract).unpause_contract(&pauser);
+        PausableContractClient::new(&env, &payment_contract).unpause_contract(&pauser);
+        PausableContractClient::new(&env, &escrow_contract).unpause_contract(&pauser);
+        PausableContractClient::new(&env, &refund_contract).unpause_contract(&pauser);
 
         Ok(())
     }
@@ -267,6 +278,9 @@ impl AdminContract {
 #[cfg(test)]
 mod test {
     use super::*;
+    use escrow::EscrowContractClient;
+    use payments::PaymentContractClient;
+    use refund::RefundContractClient;
     use soroban_sdk::testutils::Address as _;
 
     fn setup_payment(env: &Env, admin: &Address) -> Address {
