@@ -158,6 +158,87 @@ pub enum PolicyKey {
     AutoRefundTriggerCounter,
 }
 
+// Restored: these definitions were lost when two PRs both created
+// src/storage.rs and the merge kept only the TTL-helper version.
+// Maximum number of a customer's refund references kept in "hot" instance
+// storage. Older entries are moved to persistent storage (archived) so a
+// customer's history can grow indefinitely without bloating the instance
+// storage footprint read/written on every contract invocation.
+const CUSTOMER_HISTORY_HOT_CAP: u64 = 50;
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum SystemKey {
+    PauseStateKey,
+    PauseHistoryEntry(u64),
+    PauseHistoryCount,
+    CircuitBreakerConfigKey,
+    CircuitBreakerStateKey,
+    WindowStart,
+    WindowRefundVolume,
+    WindowPaymentVolume,
+    FraudSignal(Address),
+    FraudConfig,
+    FlaggedAddressesIndex,
+    // Ordered list of flagged addresses: FlaggedAddress(n) -> Address, paired
+    // with the FlaggedAddressesIndex counter so get_flagged_addresses can
+    // enumerate every entry without iterating over all storage keys.
+    FlaggedAddress(u64),
+    RefundRejectedAt(u64),
+    Appeal(u64),
+    AppealCounter,
+    AppealByRefund(u64),
+    AppealByCustomer(Address, u64),
+    AppealByCustomerCount(Address),
+    // Notification hooks
+    NotificationHook(u64),
+    NotificationHookCounter,
+    HooksByEvent(RefundEventType, u64),
+    HooksByEventCount(RefundEventType),
+    SubscriberHooks(Address, u64),
+    SubscriberHookCount(Address),
+    // Platform fee deduction on refund processing
+    RefundFeeConfig,
+    AccumulatedRefundFees,
+    // Per-customer refund cooldown
+    CustomerRefundCooldown(Address),
+    RefundCooldownConfig,
+    SchemaVersion,
+    // Issue #382: cached reason-code analytics for a given [window_start, window_end]
+    // ledger-timestamp range, so repeated queries over the same window don't
+    // re-scan the full refund history.
+    AnalyticsCache(u64, u64),
+    // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
+    // processed refund can invalidate only the windows it actually falls within.
+    AnalyticsCacheWindows,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EvidenceKey {
+    Evidence(u64, Address),
+    EvidenceIndex(u64, u64),
+    EvidenceCount(u64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum VoucherKey {
+    Voucher(u64),
+    VoucherCounter,
+    CustomerVoucher(Address, u64),
+    CustomerVoucherCount(Address),
+    RefundVoucherIssued(u64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum TokenKey {
+    SupportedToken(Address),
+    TokenCount,
+    TokenByIndex(u64),
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -322,6 +403,18 @@ pub enum ExtError {
     // Issue #88: a data migration step failed, so the schema version must not
     // be bumped (the whole transaction is reverted).
     SchemaMigrationFailed = 61,
+    // The variants below were each added as code 61 by separate PRs and lost
+    // in the merges that kept SchemaMigrationFailed; renumbered 62-67.
+    // Issue #70: cross-contract payment-state verification errors
+    PaymentContractCallFailed = 62,
+    PaymentNotCompleted = 63,
+    PaymentContractUnavailable = 64,
+    // Merchant standing: suspended/sanctioned merchants cannot issue refunds
+    MerchantNotEligible = 65,
+    // A payment may have at most one active (unresolved) refund at a time
+    ActiveRefundExists = 66,
+    // Reputation decay config out of range
+    InvalidReputationDecayConfig = 67,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1710,6 +1803,118 @@ impl RefundContract {
             gas_estimate,
             dry_run: true,
         }
+    }
+
+    /// Runs the data transformations registered for every schema version step
+    /// between `from_version` (exclusive) and `to_version` (inclusive).
+    ///
+    /// # Arguments
+    /// * `from_version` - The currently stored schema version.
+    /// * `to_version` - The requested schema version.
+    ///
+    /// # Errors
+    /// Returns `SchemaMigrationFailed` if any stored entry could not be
+    /// transformed, in which case the caller reverts every write made so far.
+    fn run_data_migrations(env: &Env, from_version: u32, to_version: u32) -> Result<(), Error> {
+        let mut version = from_version;
+        while version < to_version {
+            let next_version = version + 1;
+            // v2: every stored refund must be reachable through the status index
+            // and the customer's history index, and rejected refunds must carry
+            // their rejection timestamp. Versions without a registered data
+            // transformation are no-ops.
+            if next_version == 2 {
+                Self::migrate_v1_to_v2(env)?;
+            }
+            version = next_version;
+        }
+        Ok(())
+    }
+
+    /// v1 -> v2 data migration: backfills the per-status index, the customer
+    /// history index and the rejection bookkeeping of stored refunds.
+    ///
+    /// # Errors
+    /// Returns `SchemaMigrationFailed` if a refund referenced by the refund
+    /// counter cannot be read, or if its id does not match the indexed record.
+    fn migrate_v1_to_v2(env: &Env) -> Result<(), Error> {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+
+        for refund_id in 1..=counter {
+            let refund: Refund = env
+                .storage()
+                .instance()
+                .get(&DataKey::Refund(refund_id))
+                .ok_or(Error::Ext(ExtError::SchemaMigrationFailed))?;
+
+            // Corrupted record: the id and the stored record must agree.
+            if refund.id != refund_id {
+                return Err(Error::Ext(ExtError::SchemaMigrationFailed));
+            }
+
+            // Status index membership (RefundsByStatus / RefundStatusIndex).
+            if !env
+                .storage()
+                .instance()
+                .has(&DataKey::RefundStatusIndex(refund_id))
+            {
+                Self::add_to_status_index(env, refund.status.clone(), refund_id);
+            }
+
+            // Rejection bookkeeping used by the appeal window checks.
+            if refund.status == RefundStatus::Rejected
+                && !env
+                    .storage()
+                    .instance()
+                    .has(&SystemKey::RefundRejectedAt(refund_id))
+            {
+                let rejected_at = refund.rejected_at.unwrap_or(refund.requested_at);
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::RefundRejectedAt(refund_id), &rejected_at);
+            }
+
+            // Per-customer history index.
+            Self::index_refund_for_customer(env, &refund.customer, refund_id);
+        }
+
+        Ok(())
+    }
+
+    /// Appends `refund_id` to the customer's refund history when missing.
+    ///
+    /// Honours the hot/archive split so the migration never inflates instance
+    /// storage beyond `CUSTOMER_HISTORY_HOT_CAP` entries.
+    fn index_refund_for_customer(env: &Env, customer: &Address, refund_id: u64) {
+        let count = Self::get_customer_refund_count(env, customer);
+        if Self::customer_history_contains(env, customer, count, refund_id) {
+            return;
+        }
+        Self::append_customer_refund_history(env, customer, refund_id);
+    }
+
+    /// Returns `true` when `refund_id` is present in the customer's history
+    /// index, looking into the archive for entries that aged out of hot storage.
+    fn customer_history_contains(
+        env: &Env,
+        customer: &Address,
+        count: u64,
+        refund_id: u64,
+    ) -> bool {
+        if count == 0 {
+            return false;
+        }
+        // Healthy histories are append-only, so the newest slot is checked first.
+        for index in (0..count).rev() {
+            if Self::get_customer_refund_id_at(env, customer, index) == Some(refund_id) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Propose a new admin, starting a two-step rotation (Issue #389).
@@ -6427,7 +6632,9 @@ impl RefundContract {
             let active = match refund.status {
                 RefundStatus::Requested => refund.expires_at.is_none_or(|exp| now < exp),
                 RefundStatus::Approved | RefundStatus::PendingAppeal => true,
-                RefundStatus::Rejected | RefundStatus::Processed => false,
+                RefundStatus::Rejected
+                | RefundStatus::PermanentlyDenied
+                | RefundStatus::Processed => false,
             };
             if active {
                 return Err(Error::Ext(ExtError::ActiveRefundExists));
@@ -6729,12 +6936,12 @@ impl RefundContract {
             refund.original_payment_amount,
         )?;
 
-        // Deduct platform fee from refund amount
-        let (net_refund_amount, _fee_amount) =
-            Self::deduct_refund_fee(env, refund_id, refund.amount, &refund.token)?;
+        // Deduct platform fee from refund amount. Issue #71: `fee` carries the
+        // reconciled processing/network breakdown that goes out on the event.
+        let fee = Self::deduct_refund_fee(env, refund_id, refund.amount, &refund.token)?;
         // Arbitration awards additionally carry the protocol maintenance fee.
         let net_refund_amount =
-            Self::deduct_arbitration_protocol_fee(env, refund_id, net_refund_amount, &refund.token);
+            Self::deduct_arbitration_protocol_fee(env, refund_id, fee.net_amount, &refund.token);
 
         if net_refund_amount > 0 {
             token::Client::new(env, &refund.token).transfer(
@@ -6787,7 +6994,8 @@ impl RefundContract {
             processed_by,
             customer: refund.customer,
             amount: refund.amount,
-            net_amount: fee.net_amount,
+            // What the customer actually received (after any protocol fee).
+            net_amount: net_refund_amount,
             total_fee: fee.total_fee,
             processing_fee: fee.processing_fee,
             network_fee: fee.network_fee,
