@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
 
 /// A payment may only have one active refund at a time, so pay each refund
 /// out before requesting the next one against the same payment.
@@ -661,4 +661,120 @@ fn test_exact_boundary_count() {
         res3.unwrap_err().unwrap(),
         Error::Ext(ExtError::RefundCountCapExceeded)
     );
+}
+
+fn request_amount(
+    client: &RefundContractClient,
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    payment_id: u64,
+    amount: i128,
+    payment_amount: i128,
+) -> Result<u64, Error> {
+    match client.try_request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &amount,
+        &payment_amount,
+        token,
+        &String::from_str(env, "partial"),
+        &RefundReasonCode::CustomerRequest,
+        &0,
+    ) {
+        Ok(Ok(id)) => Ok(id),
+        Err(Ok(e)) => Err(e),
+        other => panic!("unexpected result: {:?}", other),
+    }
+}
+
+fn setup_accumulated<'a>(
+    env: &'a Env,
+) -> (RefundContractClient<'a>, Address, Address, Address, Address) {
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    let token = funded_token(env, &contract_id);
+    (
+        client,
+        admin,
+        Address::generate(env),
+        Address::generate(env),
+        token,
+    )
+}
+
+#[test]
+fn test_accumulated_refunds_exact_boundary() {
+    let env = Env::default();
+    let (client, admin, merchant, customer, token) = setup_accumulated(&env);
+
+    // 400 + 599 + 1 == 1000: every step up to the exact payment amount is allowed.
+    for amount in [400, 599, 1] {
+        let id = request_amount(
+            &client, &env, &merchant, &customer, &token, 1, amount, 1_000,
+        )
+        .unwrap();
+        settle(&client, &admin, id);
+    }
+    assert_eq!(client.get_accumulated_refunds(&1), 1_000);
+
+    // One more unit would exceed the payment.
+    assert_eq!(
+        request_amount(&client, &env, &merchant, &customer, &token, 1, 1, 1_000),
+        Err(Error::Ext(ExtError::RefundCapExceeded))
+    );
+}
+
+#[test]
+fn test_accumulated_refunds_one_over_boundary() {
+    let env = Env::default();
+    let (client, admin, merchant, customer, token) = setup_accumulated(&env);
+
+    let id = request_amount(&client, &env, &merchant, &customer, &token, 2, 700, 1_000).unwrap();
+    settle(&client, &admin, id);
+
+    // 700 + 301 = 1001 > 1000.
+    assert_eq!(
+        request_amount(&client, &env, &merchant, &customer, &token, 2, 301, 1_000),
+        Err(Error::Ext(ExtError::RefundCapExceeded))
+    );
+    assert_eq!(client.get_accumulated_refunds(&2), 700);
+    // 700 + 300 = 1000 is exactly allowed.
+    request_amount(&client, &env, &merchant, &customer, &token, 2, 300, 1_000).unwrap();
+    assert_eq!(client.get_accumulated_refunds(&2), 1_000);
+}
+
+#[test]
+fn test_accumulated_refunds_counts_pending_and_releases_on_denial() {
+    let env = Env::default();
+    let (client, admin, merchant, customer, token) = setup_accumulated(&env);
+    client.set_payment_rejection_cooldown(&admin, &0);
+
+    // A pending (not yet paid) refund already counts toward the total.
+    let pending =
+        request_amount(&client, &env, &merchant, &customer, &token, 3, 800, 1_000).unwrap();
+    assert_eq!(client.get_accumulated_refunds(&3), 800);
+
+    // Finalized denial releases it again.
+    client.reject_refund(&admin, &pending, &String::from_str(&env, "no"));
+    let deadline = client.get_refund(&pending).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&pending);
+    assert_eq!(client.get_accumulated_refunds(&3), 0);
+
+    let paid = request_amount(&client, &env, &merchant, &customer, &token, 3, 500, 1_000).unwrap();
+    settle(&client, &admin, paid);
+
+    // Reinstating the old 800 denial would make 500 + 800 > 1000.
+    assert_eq!(
+        client.try_merchant_override_denial(&merchant, &pending),
+        Err(Ok(Error::Ext(ExtError::RefundCapExceeded)))
+    );
+    assert_eq!(client.get_refund(&pending).status, RefundStatus::Rejected);
+    assert_eq!(client.get_accumulated_refunds(&3), 500);
 }

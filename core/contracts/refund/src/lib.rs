@@ -145,7 +145,24 @@ pub enum ConfigKey {
     AccumulatedFees(Address),
     // Marks a refund whose approval was awarded by arbitration
     ArbitrationAward(u64),
+    // Seconds a payment is locked from new refund requests after a denial
+    PaymentRejectionCooldown,
 }
+
+// Per-payment refund accounting.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum PaymentKey {
+    // Sum of all non-rejected refunds (pending, approved and processed)
+    // against a payment; must never exceed the payment amount.
+    AccumulatedRefunds(u64),
+    // Timestamp of the payment's most recent refund denial (cooldown anchor)
+    LastRejectedAttempt(u64),
+}
+
+// Default cooldown after a refund denial before the same payment can be
+// refunded again: 24 hours.
+pub const DEFAULT_PAYMENT_REJECTION_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -238,7 +255,6 @@ pub enum TokenKey {
     TokenCount,
     TokenByIndex(u64),
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -415,6 +431,8 @@ pub enum ExtError {
     ActiveRefundExists = 66,
     // Reputation decay config out of range
     InvalidReputationDecayConfig = 67,
+    /// Cumulative refunds for a payment would exceed the payment amount. Resolution: request at most the remaining refundable amount.
+    RefundCapExceeded = 68,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1626,6 +1644,24 @@ pub struct AdminRotationAccepted {
     pub new_admin: Address,
 }
 
+/// Event emitted when the current admin withdraws a pending rotation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationCancelled {
+    pub admin: Address,
+    pub cancelled_admin: Address,
+}
+
+/// Event emitted when a payment's merchant overrides a denial of its refund.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantOverrideApplied {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub previous_status: RefundStatus,
+}
+
 // Gas estimation constants used by the dry-run migration helper (Issue #89).
 // These model the dominant cost drivers of a schema migration: a fixed base
 // cost for opening the migration plus a per-record cost for converting each
@@ -1997,6 +2033,40 @@ impl RefundContract {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
+    /// Withdraw a pending admin rotation (e.g. one proposed to a mistyped
+    /// address). The current admin keeps control and the previously proposed
+    /// address can no longer accept.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `NoPendingAdmin` if no rotation is pending.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let cancelled_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::Ext(ExtError::NoPendingAdmin))?;
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        (AdminRotationCancelled {
+            admin,
+            cancelled_admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Request a refund for a payment.
     ///
     /// Creates a new refund request with status `Requested` (or `Approved` if auto-approval
@@ -2175,6 +2245,7 @@ impl RefundContract {
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
         Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
+        Self::record_payment_rejection(&env, refund.payment_id);
         env.storage()
             .instance()
             .set(&SystemKey::RefundRejectedAt(refund_id), &denied_at);
@@ -2197,6 +2268,100 @@ impl RefundContract {
         .publish(&env);
 
         Self::invoke_hooks(&env, RefundEventType::Rejected, refund_id);
+
+        Ok(())
+    }
+
+    /// Let a payment's merchant override the denial of a refund on that
+    /// payment, approving it instead.
+    ///
+    /// Only the merchant recorded on the refund (the merchant of the original
+    /// payment) may override; any other address is rejected even if it is a
+    /// merchant elsewhere. Works on refunds that are denied but not
+    /// permanently (`PendingAppeal` or `Rejected`), and not while an
+    /// arbitration case on the refund is still open.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if `merchant` is not the refund's merchant.
+    /// Returns `RefundNotRejected` if the refund is not in an overridable denied state.
+    /// Returns `InvalidStatus` if an arbitration case on the refund is open.
+    /// Returns `ActiveRefundExists`, `RefundCapExceeded` or the payment cap
+    /// errors if reinstating a finalized denial would breach those limits.
+    pub fn merchant_override_denial(
+        env: Env,
+        merchant: Address,
+        refund_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "merchant_override_denial")?;
+        merchant.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Only the merchant tied to the original payment may override.
+        if refund.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let previous_status = refund.status.clone();
+        if previous_status != RefundStatus::PendingAppeal
+            && previous_status != RefundStatus::Rejected
+        {
+            return Err(Error::Core(CoreError::RefundNotRejected));
+        }
+
+        // An open arbitration case owns the outcome until the panel decides.
+        if let Some(case_id) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&ArbitrationKey::CaseByRefund(refund_id))
+        {
+            if let Some(case) = env
+                .storage()
+                .instance()
+                .get::<_, ArbitrationCase>(&ArbitrationKey::ArbitrationCase(case_id))
+            {
+                if case.status == ArbitrationStatus::Open {
+                    return Err(Error::Core(CoreError::InvalidStatus));
+                }
+            }
+        }
+
+        Self::require_merchant_active(&env, &merchant)?;
+
+        if previous_status == RefundStatus::Rejected {
+            // A finalized denial released this refund's share of the payment's
+            // limits, so reserve it again before reinstating.
+            Self::ensure_no_active_refund_for_payment(&env, refund.payment_id)?;
+            Self::check_accumulated_refunds(
+                &env,
+                refund.payment_id,
+                refund.amount,
+                refund.original_payment_amount,
+            )?;
+            Self::check_payment_refund_cap(&env, refund.payment_id, refund.amount)?;
+            Self::update_payment_refund_usage(&env, refund.payment_id, refund.amount);
+        }
+
+        Self::remove_from_status_index(&env, previous_status.clone(), refund_id)?;
+        refund.status = RefundStatus::Approved;
+        refund.approved_at = Some(env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Approved, refund_id);
+
+        (MerchantOverrideApplied {
+            refund_id,
+            payment_id: refund.payment_id,
+            merchant,
+            previous_status,
+        })
+        .publish(&env);
+        Self::invoke_hooks(&env, RefundEventType::Approved, refund_id);
 
         Ok(())
     }
@@ -2480,6 +2645,7 @@ impl RefundContract {
                     .set(&DataKey::Refund(refund.id), &refund);
                 Self::add_to_status_index(&env, RefundStatus::PermanentlyDenied, refund.id);
                 Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
+                Self::record_payment_rejection(&env, refund.payment_id);
             }
         }
 
@@ -3499,6 +3665,7 @@ impl RefundContract {
                 .set(&DataKey::Refund(case.refund_id), &refund);
             Self::add_to_status_index(&env, RefundStatus::Rejected, refund.id);
             Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
+            Self::record_payment_rejection(&env, refund.payment_id);
 
             (RefundDeniedEvent {
                 refund_id: case.refund_id,
@@ -6685,8 +6852,13 @@ impl RefundContract {
         // fresh throwaway customer addresses can't open parallel refunds
         // against the same payment.
         Self::ensure_no_active_refund_for_payment(&env, payment_id)?;
+        // A recently denied payment can't be re-requested until its cooldown
+        // elapses, so a denial can't be answered with immediate re-spam.
+        Self::check_payment_rejection_cooldown(&env, payment_id)?;
 
-        Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
+        // sum(refunds) <= payment amount, counting pending, approved and
+        // processed refunds (not just processed ones).
+        Self::check_accumulated_refunds(&env, payment_id, amount, original_payment_amount)?;
         Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
         Self::check_and_update_customer_refund_rate_limit(&env, customer.clone())?;
 
@@ -10136,6 +10308,12 @@ impl RefundContract {
             &DataKey::PaymentRefundUsage(payment_id),
             &(new_count, new_amount),
         );
+
+        let accumulated = Self::get_accumulated_refunds(env.clone(), payment_id);
+        env.storage().instance().set(
+            &PaymentKey::AccumulatedRefunds(payment_id),
+            &accumulated.saturating_add(refund_amount),
+        );
     }
 
     fn release_payment_refund_usage(env: &Env, payment_id: u64, refund_amount: i128) {
@@ -10152,6 +10330,100 @@ impl RefundContract {
             &DataKey::PaymentRefundUsage(payment_id),
             &(new_count, new_amount),
         );
+
+        // A rejected/expired refund no longer counts toward the payment total.
+        let accumulated = Self::get_accumulated_refunds(env.clone(), payment_id);
+        env.storage().instance().set(
+            &PaymentKey::AccumulatedRefunds(payment_id),
+            &accumulated.saturating_sub(refund_amount).max(0),
+        );
+    }
+
+    /// Cumulative amount of all non-rejected refunds (pending, approved and
+    /// processed) recorded against `payment_id`.
+    pub fn get_accumulated_refunds(env: Env, payment_id: u64) -> i128 {
+        env.storage()
+            .instance()
+            .get(&PaymentKey::AccumulatedRefunds(payment_id))
+            .unwrap_or(0)
+    }
+
+    /// Reject a refund that would push the payment's cumulative refunds over
+    /// the payment amount.
+    fn check_accumulated_refunds(
+        env: &Env,
+        payment_id: u64,
+        amount: i128,
+        payment_amount: i128,
+    ) -> Result<(), Error> {
+        let accumulated = Self::get_accumulated_refunds(env.clone(), payment_id);
+        let new_total = accumulated
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        if new_total > payment_amount {
+            return Err(Error::Ext(ExtError::RefundCapExceeded));
+        }
+        Ok(())
+    }
+
+    /// Set how long a payment is locked from new refund requests after a
+    /// denial (0 disables the cooldown).
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    pub fn set_payment_rejection_cooldown(
+        env: Env,
+        admin: Address,
+        cooldown_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&ConfigKey::PaymentRejectionCooldown, &cooldown_seconds);
+        Ok(())
+    }
+
+    /// Cooldown after a denial before a payment can be refunded again
+    /// (default 24 hours).
+    pub fn get_payment_rejection_cooldown(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&ConfigKey::PaymentRejectionCooldown)
+            .unwrap_or(DEFAULT_PAYMENT_REJECTION_COOLDOWN_SECS)
+    }
+
+    /// Timestamp of the payment's most recent refund denial, if any.
+    pub fn get_last_rejected_attempt(env: Env, payment_id: u64) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&PaymentKey::LastRejectedAttempt(payment_id))
+    }
+
+    fn record_payment_rejection(env: &Env, payment_id: u64) {
+        env.storage().instance().set(
+            &PaymentKey::LastRejectedAttempt(payment_id),
+            &env.ledger().timestamp(),
+        );
+    }
+
+    fn check_payment_rejection_cooldown(env: &Env, payment_id: u64) -> Result<(), Error> {
+        let last: u64 = match Self::get_last_rejected_attempt(env.clone(), payment_id) {
+            Some(ts) => ts,
+            None => return Ok(()),
+        };
+        let cooldown = Self::get_payment_rejection_cooldown(env.clone());
+        if env.ledger().timestamp() < last.saturating_add(cooldown) {
+            return Err(Error::Core(CoreError::RefundCooldownActive));
+        }
+        Ok(())
     }
 
     fn clear_arbitration_votes(env: &Env, case_id: u64) {
