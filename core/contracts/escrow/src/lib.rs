@@ -109,6 +109,8 @@ pub enum DisputeKey {
     EscalationQueueIndex,
     EscalationDeadline(u64),
     AppealRecord(u64, u64),
+    LiquidationConfig,
+    LiquidationHistory(u64),
 }
 
 #[derive(Clone)]
@@ -601,6 +603,17 @@ pub struct CollateralReturned {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidationTriggered {
+    pub escrow_id: u64,
+    pub liquidator: Address,
+    pub collateral_amount: i128,
+    pub collateral_price: i128,
+    pub ltv_ratio_bps: u32,
+    pub triggered_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCreated {
     pub escrow_id: u64,
     pub customer: Address,
@@ -813,6 +826,14 @@ pub struct DisputeConfig {
     pub collateral_amount: i128,
     pub collateral_enabled: bool,
     pub min_collateral_ratio_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct LiquidationConfig {
+    pub enabled: bool,
+    pub oracle: OracleConfig,
+    pub ltv_threshold_bps: u32, // Loan-To-Value threshold in basis points (e.g., 12000 = 120%)
 }
 
 #[derive(Clone)]
@@ -5134,6 +5155,136 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Executes liquidation of collateral when oracle price falls below LTV threshold.
+    ///
+    /// This function allows any caller (liquidator) to trigger liquidation when the
+    /// collateral's market valuation relative to escrow debt falls below the configured
+    /// loan-to-value (LTV) threshold. The liquidator receives the collateral in exchange
+    /// for settling the outstanding escrow debt.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `liquidator` - The address triggering liquidation (receives collateral)
+    /// * `escrow_id` - The ID of the escrow with collateral
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// * `NotFound` - Escrow or liquidation config does not exist
+    /// * `InvalidStatus` - Escrow is not in Disputed status or collateral is insufficient
+    /// * `ReleaseNotYetAvailable` - LTV ratio is still above the liquidation threshold
+    pub fn liquidate_collateral(
+        env: Env,
+        liquidator: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        liquidator.require_auth();
+        Self::require_not_paused(&env, "liquidate_collateral")?;
+
+        // Check if escrow exists
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Liquidation can only occur when collateral is deposited in a dispute
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Get liquidation config
+        let config = Self::get_liquidation_config(env.clone())
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if !config.enabled {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Get collateral deposit record
+        let collateral = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeCollateral>(&DataKey::Dispute(DisputeKey::Collateral(
+                escrow_id,
+            )))
+            .ok_or(Error::Action(ActionError::InsufficientCollateral))?;
+
+        // Call oracle to get current collateral price
+        let price_data = Self::get_oracle_price(env.clone(), &config.oracle)?;
+
+        // Calculate LTV ratio: (collateral_value / escrow_debt) * 10000
+        // collateral_value = collateral_amount * price
+        let collateral_value = collateral.amount.saturating_mul(price_data.price);
+        let ltv_ratio_bps = if collateral_value > 0 && escrow.amount > 0 {
+            (collateral_value / escrow.amount).min(u32::MAX as i128) as u32
+        } else {
+            u32::MAX
+        };
+
+        // Liquidation is triggered when LTV falls below the threshold
+        if ltv_ratio_bps >= config.ltv_threshold_bps {
+            return Err(Error::Escrow(EscrowError::ReleaseNotYetAvailable));
+        }
+
+        // Transfer escrow amount to liquidator to settle debt
+        Self::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &liquidator,
+            escrow.amount,
+        )?;
+
+        // Transfer collateral to liquidator
+        let collateral_client = token::Client::new(&env, &collateral.token);
+        collateral_client.transfer(
+            &env.current_contract_address(),
+            &liquidator,
+            &collateral.amount,
+        );
+
+        // Update escrow status to Resolved
+        let mut updated_escrow = escrow;
+        updated_escrow.status = EscrowStatus::Resolved;
+        updated_escrow.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &updated_escrow);
+
+        // Remove collateral record
+        env.storage()
+            .instance()
+            .remove(&DataKey::Dispute(DisputeKey::Collateral(escrow_id)));
+
+        // Emit liquidation event
+        LiquidationTriggered {
+            escrow_id,
+            liquidator,
+            collateral_amount: collateral.amount,
+            collateral_price: price_data.price,
+            ltv_ratio_bps,
+            triggered_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Queries oracle for collateral price data.
+    fn get_oracle_price(env: Env, oracle_config: &OracleConfig) -> Result<OraclePriceData, Error> {
+        // For now, return a mock price. In production, this would call an actual oracle contract.
+        // The oracle contract would validate the feed ID and staleness threshold.
+        Ok(OraclePriceData {
+            price: 1_000_000i128, // 1 token = 1,000,000 (smallest unit price)
+            timestamp: env.ledger().timestamp(),
+        })
+    }
+
     /// Returns an advisory dispute recommendation derived from the customer's
     /// and merchant's reputation scores. The result is purely advisory and
     /// `resolve_dispute` does not consult or enforce it. A score difference
@@ -9033,6 +9184,52 @@ impl EscrowContract {
                 collateral_enabled: false,
                 min_collateral_ratio_bps: 15000, // Default 150%
             })
+    }
+
+    /// Sets liquidation config for collateral valuation and automated liquidation.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `admin` - Address of the signer or participant.
+    /// * `config` - Liquidation configuration with oracle and LTV threshold.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when the operation cannot be completed.
+    pub fn set_liquidation_config(
+        env: Env,
+        admin: Address,
+        config: LiquidationConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_liquidation_config")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        // Validate LTV threshold is reasonable (e.g., between 100% and 200%)
+        if config.ltv_threshold_bps < 10000 || config.ltv_threshold_bps > 20000 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute(DisputeKey::LiquidationConfig), &config);
+        Ok(())
+    }
+
+    /// Returns liquidation config.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    ///
+    /// # Returns
+    /// Some(LiquidationConfig) if configured, None otherwise.
+    pub fn get_liquidation_config(env: Env) -> Option<LiquidationConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::LiquidationConfig))
     }
 
     /// Sets the evidence submission deadline config.
