@@ -359,6 +359,7 @@ pub enum EscrowStatus {
     Disputed,
     Resolved,
     Cancelled,
+    ExpiredRefunded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
