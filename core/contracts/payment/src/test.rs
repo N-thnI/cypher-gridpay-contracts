@@ -15,6 +15,7 @@
 extern crate std;
 
 use proptest::prelude::*;
+use test_utils::{create_mock_token, generate_parties, setup_test_env};
 
 /// Pure fee calculation mirroring the on-chain tiered fee logic.
 ///
@@ -32,6 +33,15 @@ fn calculate_fee(amount: i128, bps: u32) -> i128 {
 /// Net amount after deducting the fee from the gross amount.
 fn net_amount(amount: i128, fee: i128) -> i128 {
     amount.saturating_sub(fee)
+}
+
+#[test]
+fn shared_fixtures_provide_token_and_parties() {
+    let env = setup_test_env();
+    let (payer, payee, _arbiter) = generate_parties(&env);
+    let token = create_mock_token(&env, &payer, 1_000);
+    assert_ne!(payer, payee);
+    assert_eq!(token, token.clone());
 }
 
 proptest! {
