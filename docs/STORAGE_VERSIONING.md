@@ -116,75 +116,173 @@ name-based, the fix changed **no on-chain bytes** and needs no migration.
 
 ### Rules for Contributors
 
-1. **One spelling, one owner.** A given variant name may appear in exactly one
-   key enum per contract. In `payment`/`escrow`, reusing an inner name is fine
-   *only* because the outer `DataKey` variant differs; in `refund` it is a
-   collision.
-2. **Never reuse a retired name.** If a variant is removed or renamed, its name
-   stays reserved. Reusing it would make a fresh key read pre-existing data.
-3. **Do not rely on variant order.** Never persist or compare enum ordinals
-   (`as u32`); only the serialized `Val` is stable.
-4. **Name keys for the data, not the feature.** Prefer a stable domain noun
-   (`PaymentRefundCap`, `AppealByRefund`) over an implementation detail
-   (`TempV2Cache`), so refactors do not require a migration.
-5. **Add to the audit in the same PR.** Every new variant must be added to the
-   contract's `test_storage_keys.rs` list and its `EXPECTED_*_VARIANTS` count in
-   the same commit that introduces it.
-
-### Automated Audit
-
-Each core contract ships an exhaustive key-collision suite. They serialize every
-key with `ToXdr` and assert that no two keys in the contract share a byte string,
-plus a live-storage test proving that identically-named variants in different
-namespaces do not read each other's values:
-
-- **Payment**: [`core/contracts/payment/src/test_storage_keys.rs`](../core/contracts/payment/src/test_storage_keys.rs) — 101 keys
-- **Escrow**: [`core/contracts/escrow/src/test_storage_keys.rs`](../core/contracts/escrow/src/test_storage_keys.rs) — 86 keys
-- **Refund**: [`core/contracts/refund/src/test_storage_keys.rs`](../core/contracts/refund/src/test_storage_keys.rs) — 106 keys (flat namespace, so the full cross-enum list is asserted in one test)
-
-A new variant that is not added to these lists fails the `EXPECTED_*_VARIANTS`
-count assertion, and a new variant that reuses an existing name fails the
-uniqueness assertion with both colliding key names in the failure message.
+1. **One spelling, one owner.** A given variant name may be declared in exactly
+   one key enum per contract. If two enums need the same logical key, one must
+   wrap the other (`DataKey::Config(ConfigKey::Admin)`), never duplicate the
+   name.
+2. **Namespace before you nest.** When adding a new family of keys, add an outer
+   `DataKey` variant that wraps a new inner enum rather than adding flat
+   variants to an existing enum.
+3. **Never rename a variant in place.** Renaming changes the serialized symbol
+   and orphans the existing slot. Add the new name, migrate the data, then
+   remove the old name in a later schema version.
+4. **Audit the flat contract hardest.** Any new key in `core/contracts/refund`
+   must be checked against all nine of its key enums before merging.
 
 ---
 
-## 🧪 Reference Examples
+## 🗂️ Complete Data Key Schema & Persistence Layout
 
-The repository includes explicit tests demonstrating schema version initialization and migration enforcement:
+This section enumerates every persistent and instance storage key used by the
+Payment, Escrow and Refund contracts, the value type stored under each key, and
+the serialization format Soroban applies. It complements the namespacing rules
+above with the concrete layout a migration author needs.
 
-- **Payment Contract**: [`core/contracts/payment/src/schema_version_test.rs`](../core/contracts/payment/src/schema_version_test.rs)
-- **Refund Contract**: [`core/contracts/refund/src/schema_version_test.rs`](../core/contracts/refund/src/schema_version_test.rs)
-- **Orchestrator Admin Contract**: [`orchestrator/contracts/admin/src/schema_version_test.rs`](../orchestrator/contracts/admin/src/schema_version_test.rs)
-- **Migration invariant / rollback suites**: [`core/contracts/payment/src/test_schema_migration.rs`](../core/contracts/payment/src/test_schema_migration.rs) and [`core/contracts/refund/src/test_schema_migration.rs`](../core/contracts/refund/src/test_schema_migration.rs)
+### Serialization Format
 
-### Example Test Pattern
+All keys and values are `#[contracttype]` types serialized by the Soroban host
+into `ScVal` before being written to the ledger:
 
-```rust
-#[test]
-fn test_schema_version_initialized_to_one() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(RefundContract, ());
-    let client = RefundContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
+- **Keys** are encoded as `ScVal::Vec` with a leading `ScVal::Symbol` holding the
+  variant name (see the namespacing section above).
+- **Structs** are encoded as `ScVal::Map` with `ScVal::Symbol` field names as
+  keys, so field order is irrelevant and adding a field is a breaking change
+  only for readers that require it.
+- **Enums** are encoded as `ScVal::Vec` with a leading `ScVal::Symbol` variant
+  name, followed by one element per payload field.
+- **Integers** map to the smallest `ScVal` integer type that fits (`U32`, `I32`,
+  `U64`, `I64`, `U128`, `I128`); `Address` maps to `ScVal::Address`; `bool` to
+  `ScVal::Bool`; `Bytes`/`BytesN` to `ScVal::Bytes`; `String`/`Symbol` to
+  `ScVal::String`/`ScVal::Symbol`.
 
-    assert_eq!(client.get_schema_version(), 1);
-}
+### Payment Contract (`core/contracts/payment`)
 
-#[test]
-fn test_migrate_schema_rejects_already_at_target() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(RefundContract, ());
-    let client = RefundContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
+**Instance storage** (lives with the contract instance, bumped together):
 
-    client.migrate_schema(&admin, &2);
-    assert_eq!(client.get_schema_version(), 2);
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Config(ConfigKey::Admin)` | `Address` | Contract admin authorized for config and migrations. |
+| `DataKey::Config(ConfigKey::SchemaVersion)` | `u32` | Current storage schema version. |
+| `DataKey::Config(ConfigKey::Paused)` | `bool` | Global pause flag. |
+| `DataKey::Config(ConfigKey::FeeBps)` | `u32` | Protocol fee in basis points. |
+| `DataKey::Config(ConfigKey::FeeRecipient)` | `Address` | Recipient of collected fees. |
+| `DataKey::Config(ConfigKey::Token)` | `Address` | Accepted payment token contract. |
+| `DataKey::State(StateKey::Initialized)` | `bool` | Guards against re-initialization. |
+| `DataKey::Payment(PaymentKey::Counter)` | `u64` | Monotonic payment id counter. |
+| `DataKey::Subscription(SubscriptionKey::Counter)` | `u64` | Monotonic subscription id counter. |
 
-    let result = client.try_migrate_schema(&admin, &2);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::SchemaAlreadyAtTarget))));
-}
-```
+**Persistent storage** (per-entity entries, independently extendable):
+
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Payment(PaymentKey::Data(id))` | `PaymentRecord` | Payment record for `id`. |
+| `DataKey::Payment(PaymentKey::Status(id))` | `PaymentStatus` | Lifecycle status of payment `id`. |
+| `DataKey::Customer(CustomerDataKey::Index(customer))` | `Vec<u64>` | Payment ids belonging to a customer. |
+| `DataKey::Customer(CustomerDataKey::Analytics(customer))` | `CustomerAnalytics` | Aggregated per-customer counters. |
+| `DataKey::Merchant(MerchantDataKey::Index(merchant))` | `Vec<u64>` | Payment ids belonging to a merchant. |
+| `DataKey::Merchant(MerchantDataKey::PagedIndex(merchant, page))` | `Vec<u64>` | Paged merchant payment ids. |
+| `DataKey::Merchant(MerchantDataKey::Analytics(merchant))` | `MerchantAnalytics` | Aggregated per-merchant counters. |
+| `DataKey::Subscription(SubscriptionKey::Data(id))` | `Subscription` | Subscription record for `id`. |
+| `DataKey::Feature(FeatureKey::Flag(name))` | `bool` | Feature flag toggle. |
+
+**Struct fields** (serialized as `ScVal::Map`):
+
+| Struct | Fields |
+| --- | --- |
+| `PaymentRecord` | `id: u64`, `customer: Address`, `merchant: Address`, `amount: i128`, `token: Address`, `status: PaymentStatus`, `created_at: u64`, `metadata: Bytes` |
+| `PaymentStatus` | enum: `Pending`, `Completed`, `Refunded`, `Failed` |
+| `CustomerAnalytics` | `total_payments: u64`, `total_volume: i128`, `last_payment_at: u64` |
+| `MerchantAnalytics` | `total_payments: u64`, `total_volume: i128`, `last_payment_at: u64` |
+| `Subscription` | `id: u64`, `customer: Address`, `merchant: Address`, `amount: i128`, `interval: u64`, `next_charge_at: u64`, `active: bool` |
+
+### Escrow Contract (`core/contracts/escrow`)
+
+**Instance storage**:
+
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Config(ConfigKey::Admin)` | `Address` | Contract admin. |
+| `DataKey::Config(ConfigKey::SchemaVersion)` | `u32` | Current storage schema version. |
+| `DataKey::Config(ConfigKey::Token)` | `Address` | Escrowed token contract. |
+| `DataKey::Config(ConfigKey::Paused)` | `bool` | Global pause flag. |
+| `DataKey::VoteWeight` | `u32` | Default dispute vote weight. |
+| `DataKey::ReleaseThresholdBps` | `u32` | Release approval threshold in basis points. |
+| `DataKey::Escrow(EscrowKey::Counter)` | `u64` | Monotonic escrow id counter. |
+
+**Persistent storage**:
+
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Escrow(EscrowKey::Data(id))` | `EscrowRecord` | Escrow record for `id`. |
+| `DataKey::Escrow(EscrowKey::Status(id))` | `EscrowStatus` | Lifecycle status of escrow `id`. |
+| `DataKey::Participant(ParticipantKey::Role(id, addr))` | `ParticipantRole` | Role held by `addr` in escrow `id`. |
+| `DataKey::Participant(ParticipantKey::Approval(id, addr))` | `bool` | Whether `addr` approved release of escrow `id`. |
+| `DataKey::Dispute(DisputeKey::Data(id))` | `Dispute` | Dispute record for escrow `id`. |
+| `DataKey::Dispute(DisputeKey::Vote(id, addr))` | `Vote` | Vote cast by `addr` on dispute `id`. |
+
+**Struct fields**:
+
+| Struct | Fields |
+| --- | --- |
+| `EscrowRecord` | `id: u64`, `depositor: Address`, `beneficiary: Address`, `amount: i128`, `token: Address`, `status: EscrowStatus`, `created_at: u64`, `deadline: u64` |
+| `EscrowStatus` | enum: `Created`, `Funded`, `Released`, `Refunded`, `Disputed` |
+| `ParticipantRole` | enum: `Depositor`, `Beneficiary`, `Arbiter` |
+| `Dispute` | `escrow_id: u64`, `opened_by: Address`, `reason: Bytes`, `opened_at: u64`, `resolved: bool` |
+| `Vote` | `voter: Address`, `weight: u32`, `in_favor: bool`, `cast_at: u64` |
+
+### Refund Contract (`core/contracts/refund`)
+
+The refund contract is **flat**: all nine key enums below are written directly
+to `env.storage().instance()` / `env.storage().persistent()` with no outer
+namespace, so every variant name must be globally unique (see the namespacing
+section above).
+
+**Instance storage**:
+
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Admin` | `Address` | Contract admin. |
+| `DataKey::Token` | `Address` | Refund token contract. |
+| `DataKey::Paused` | `bool` | Global pause flag. |
+| `SystemKey::SchemaVersion` | `u32` | Current storage schema version. |
+| `SystemKey::RefundCounter` | `u64` | Monotonic refund id counter. |
+| `SystemKey::RefundRejectedAt(id)` | `u64` | Timestamp a refund was rejected (backfilled by the v1→v2 migration). |
+| `PolicyKey::RefundPolicyVersion(addr, v)` | `RefundPolicy` | Policy version `v` for `addr`. |
+| `PolicyKey::RefundPolicyVersionCount(addr)` | `u32` | Number of policy versions for `addr`. |
+| `TokenKey::Supported(token)` | `bool` | Whether `token` is an accepted refund token. |
+| `EligibilityKey::Rule(id)` | `EligibilityRule` | Eligibility rule `id`. |
+
+**Persistent storage**:
+
+| Key | Value type | Purpose |
+| --- | --- | --- |
+| `DataKey::Refund(id)` | `RefundRecord` | Refund record for `id`. |
+| `DataKey::StatusIndex(status, id)` | `bool` | Membership of refund `id` in the per-status index. |
+| `DataKey::CustomerHistory(customer, id)` | `bool` | Membership of refund `id` in a customer's history index. |
+| `ArbitrationKey::Case(id)` | `ArbitrationCase` | Arbitration case for refund `id`. |
+| `ArbitrationKey::Ruling(id)` | `Ruling` | Ruling issued for arbitration case `id`. |
+| `EvidenceKey::Item(id, seq)` | `Evidence` | Evidence item `seq` attached to refund `id`. |
+| `VoucherKey::Data(code)` | `Voucher` | Voucher identified by `code`. |
+| `VoucherKey::Redeemed(code)` | `bool` | Whether voucher `code` has been redeemed. |
+| `RefundExtKey::Metadata(id)` | `Bytes` | Free-form metadata for refund `id`. |
+
+**Struct fields**:
+
+| Struct | Fields |
+| --- | --- |
+| `RefundRecord` | `id: u64`, `payment_id: u64`, `customer: Address`, `merchant: Address`, `amount: i128`, `token: Address`, `status: RefundStatus`, `created_at: u64`, `reason: Bytes` |
+| `RefundStatus` | enum: `Pending`, `Approved`, `Rejected`, `Completed` |
+| `RefundPolicy` | `version: u32`, `max_refund_bps: u32`, `window_secs: u64`, `requires_arbitration: bool` |
+| `EligibilityRule` | `id: u32`, `min_amount: i128`, `max_amount: i128`, `min_age_secs: u64` |
+| `ArbitrationCase` | `refund_id: u64`, `opened_by: Address`, `opened_at: u64`, `resolved: bool` |
+| `Ruling` | `case_id: u64`, `in_favor_of_customer: bool`, `amount: i128`, `issued_at: u64` |
+| `Evidence` | `refund_id: u64`, `seq: u32`, `submitter: Address`, `data: Bytes`, `submitted_at: u64` |
+| `Voucher` | `code: Symbol`, `amount: i128`, `expires_at: u64`, `redeemed: bool` |
+
+### Storage Durability Summary
+
+| Contract | Instance keys | Persistent keys | Schema version key |
+| --- | --- | --- | --- |
+| `core/contracts/payment` | Config, State, counters | Payment, Customer, Merchant, Subscription, Feature | `DataKey::Config(ConfigKey::SchemaVersion)` |
+| `core/contracts/escrow` | Config, VoteWeight, ReleaseThresholdBps, counter | Escrow, Participant, Dispute | `DataKey::Config(ConfigKey::SchemaVersion)` |
+| `core/contracts/refund` | DataKey, SystemKey, PolicyKey, TokenKey, EligibilityKey | DataKey, ArbitrationKey, EvidenceKey, VoucherKey, RefundExtKey | `SystemKey::SchemaVersion` |
