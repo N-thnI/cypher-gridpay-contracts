@@ -457,6 +457,14 @@ fn test_new_refund_allowed_once_previous_is_resolved() {
     let deadline = client.get_refund(&second).appeal_deadline.unwrap();
     env.ledger().set_timestamp(deadline);
     client.finalize_denial(&second);
+    // The denial starts the payment's rejection cooldown (24h by default)...
+    assert_eq!(
+        request(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Core(CoreError::RefundCooldownActive))
+    );
+    // ...after which the payment can be refunded again.
+    env.ledger()
+        .set_timestamp(deadline + DEFAULT_PAYMENT_REJECTION_COOLDOWN_SECS);
     request(&client, &env, &merchant, &customer, &token, 7).unwrap();
 }
 

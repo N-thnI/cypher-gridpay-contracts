@@ -107,3 +107,145 @@ fn test_refund_cooldown_allows_after_window() {
         &1000u64,
     );
 }
+
+const DAY: u64 = 24 * 60 * 60;
+
+fn request_on_payment(
+    client: &RefundContractClient,
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    payment_id: u64,
+) -> Result<u64, Error> {
+    match client.try_request_refund(
+        merchant,
+        &payment_id,
+        customer,
+        &100,
+        &1_000,
+        token,
+        &String::from_str(env, "please refund"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    ) {
+        Ok(Ok(id)) => Ok(id),
+        Err(Ok(e)) => Err(e),
+        other => panic!("unexpected result: {:?}", other),
+    }
+}
+
+/// Denies a refund on `payment_id` and finalizes the denial. Returns the
+/// time the denial became final (the cooldown anchor).
+fn deny_and_finalize(
+    client: &RefundContractClient,
+    env: &Env,
+    admin: &Address,
+    refund_id: u64,
+) -> u64 {
+    client.reject_refund(admin, &refund_id, &String::from_str(env, "denied"));
+    let deadline = client.get_refund(&refund_id).appeal_deadline.unwrap();
+    env.ledger().set_timestamp(deadline);
+    client.finalize_denial(&refund_id);
+    deadline
+}
+
+#[test]
+fn test_payment_rejection_cooldown_blocks_then_allows() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    assert_eq!(client.get_payment_rejection_cooldown(), DAY); // default 24h
+
+    let refund_id = request_on_payment(&client, &env, &merchant, &customer, &token, 42).unwrap();
+    let denied_at = deny_and_finalize(&client, &env, &admin, refund_id);
+    assert_eq!(client.get_last_rejected_attempt(&42), Some(denied_at));
+
+    // Within the cooldown: rejected, even from a fresh customer address.
+    for offset in [0, DAY / 2, DAY - 1] {
+        env.ledger().set_timestamp(denied_at + offset);
+        assert_eq!(
+            request_on_payment(&client, &env, &merchant, &customer, &token, 42),
+            Err(Error::Core(CoreError::RefundCooldownActive))
+        );
+        assert_eq!(
+            request_on_payment(
+                &client,
+                &env,
+                &merchant,
+                &Address::generate(&env),
+                &token,
+                42
+            ),
+            Err(Error::Core(CoreError::RefundCooldownActive))
+        );
+    }
+
+    // Other payments are unaffected by this payment's cooldown.
+    request_on_payment(&client, &env, &merchant, &customer, &token, 43).unwrap();
+
+    // Once the cooldown has elapsed the payment can be refunded again.
+    env.ledger().set_timestamp(denied_at + DAY);
+    request_on_payment(&client, &env, &merchant, &customer, &token, 42).unwrap();
+}
+
+#[test]
+fn test_payment_rejection_cooldown_is_configurable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.set_payment_rejection_cooldown(&admin, &3_600);
+    let refund_id = request_on_payment(&client, &env, &merchant, &customer, &token, 7).unwrap();
+    let denied_at = deny_and_finalize(&client, &env, &admin, refund_id);
+
+    env.ledger().set_timestamp(denied_at + 3_599);
+    assert_eq!(
+        request_on_payment(&client, &env, &merchant, &customer, &token, 7),
+        Err(Error::Core(CoreError::RefundCooldownActive))
+    );
+    env.ledger().set_timestamp(denied_at + 3_600);
+    request_on_payment(&client, &env, &merchant, &customer, &token, 7).unwrap();
+
+    assert_eq!(
+        client.try_set_payment_rejection_cooldown(&merchant, &0),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+}
+
+#[test]
+fn test_expired_request_does_not_start_payment_cooldown() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.set_refund_ttl_config(&admin, &3_600);
+
+    // A request that merely went stale was never denied, so no cooldown.
+    let refund_id = request_on_payment(&client, &env, &merchant, &customer, &token, 9).unwrap();
+    env.ledger().set_timestamp(1_000 + 3_600);
+    client.expire_stale_refund(&refund_id);
+    assert_eq!(client.get_last_rejected_attempt(&9), None);
+    request_on_payment(&client, &env, &merchant, &customer, &token, 9).unwrap();
+}
